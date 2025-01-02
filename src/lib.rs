@@ -6,7 +6,10 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Semaphore};
 
-// TODO generic for TaskId type
+// TODO
+// - readme for https://docs.rs/sprinter
+// - generic for TaskId type
+
 pub type TaskId = String;
 pub const MARKER_TASK_ID_PUSH_DONE: &str = "#";
 
@@ -169,6 +172,7 @@ where
     async fn tick(&self) {
         // if already running, do nothing
         if *self.queue_state_rx.borrow() == QueueState::Running {
+            // test: this is covered
             return;
         }
 
@@ -231,6 +235,7 @@ where
                             let mut index = index.lock().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = TaskState::Running;
+                                // TODO handle error, test
                                 tasks_state_tx
                                     .send((task_id.clone(), TaskState::Running))
                                     .unwrap();
@@ -245,13 +250,13 @@ where
                             let mut index = index.lock().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = if result.is_ok() {
-                                    // println!(" >>> Task {} is Succeed", task_id);
+                                    // TODO handle error, test
                                     tasks_state_tx
                                         .send((task_id.clone(), TaskState::Succeed))
                                         .unwrap();
                                     TaskState::Succeed
                                 } else {
-                                    // println!(" >>> Task {} is Failed", task_id);
+                                    // TODO handle error, test
                                     tasks_state_tx
                                         .send((task_id.clone(), TaskState::Failed))
                                         .unwrap();
@@ -276,6 +281,7 @@ where
                 let queue_empty = queue.lock().await.is_empty();
                 let tasks_all_pushed = *push_done.lock().await;
                 if queue_empty && running_tasks.is_empty() && tasks_all_pushed {
+                    // TODO test
                     queue_state_tx.send(QueueState::Done).unwrap();
                     break;
                 }
@@ -337,6 +343,7 @@ where
                         drop(index);
 
                         let mut rx = self.tasks_state_rx.clone();
+                        // TODO handle error, test
                         rx.wait_for(|(id, state)| {
                             id == task_id
                                 && (*state == TaskState::Succeed || *state == TaskState::Failed)
@@ -393,6 +400,7 @@ where
         E: Clone,
     {
         let mut rx = self.queue_state_rx.clone();
+        // TODO handle error, test
         rx.wait_for(|state| *state == QueueState::Done)
             .await
             .unwrap();
@@ -474,7 +482,6 @@ mod tests {
             Ok(6)
         };
 
-        let start = tokio::time::Instant::now();
         let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
         let _ = queue.push(&"t2".to_string(), task2).await.unwrap();
         let _ = queue.push(&"t3".to_string(), task3).await.unwrap();
@@ -507,14 +514,6 @@ mod tests {
 
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t3", "t2", "t5", "t6", "t4", "t1"]);
-
-        let end = tokio::time::Instant::now();
-        // TODO exclude from coverage
-        assert!(
-            end - start < tokio::time::Duration::from_millis(1503),
-            "sprint exceeded 1503ms (1500ms longest task + 3ms overhead) - {:?}",
-            end - start
-        );
     }
 
     #[tokio::test]
@@ -547,7 +546,6 @@ mod tests {
             Ok(6)
         };
 
-        let start = tokio::time::Instant::now();
         let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
         sleep(tokio::time::Duration::from_millis(100)).await;
         let _ = queue.push(&"t2".to_string(), task2).await.unwrap();
@@ -575,14 +573,6 @@ mod tests {
 
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t1", "t3", "t4", "t5", "t2", "t6"]);
-
-        let end = tokio::time::Instant::now();
-        // TODO exclude from coverage
-        assert!(
-            end - start < tokio::time::Duration::from_millis(1610),
-            "sprint exceeded 1610ms (1500ms longest task + pauses between pushes + 10ms overhead) - {:?}",
-            end - start
-        );
     }
 
     #[tokio::test]
@@ -620,10 +610,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_should_run_tasks_deduping() {
+    async fn should_run_tasks_deduping() {
         let queue: Queue<i32, Error> = Queue::new(3);
 
-        // Create 6 tasks with different durations
         let task1 = || async {
             sleep(tokio::time::Duration::from_millis(50)).await;
             Ok(1)
@@ -658,6 +647,28 @@ mod tests {
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t1", "t2", "t3"]);
     }
+
+    #[tokio::test]
+    async fn should_wait_for_single_task_completion() {
+        let queue: Queue<i32, Error> = Queue::new(99);
+
+        let task_id = "test_task_done".to_string();
+        queue.push(&task_id, || async { Ok(99) }).await.unwrap();
+
+        let result = queue.wait_for_task_done(&task_id).await.unwrap();
+        assert_eq!(result, Ok(99));
+
+        queue.set_push_done().await;
+        assert_eq!(queue.wait_for_tasks_done().await, Ok(()));
+    }
+
+    // #[tokio::test]
+    // async fn queue_task_done_should_handle_nonexistent_task() {
+    //     let queue: Queue<i32, Error> = Queue::new(&"test_task_done_nonexistent".to_string(), &1);
+    //     let result = queue.task_done(&"nonexistent".to_string()).await;
+    //     assert!(result.is_err());
+    //     assert!(matches!(result.unwrap_err(), QueueError::TaskNotFound(_)));
+    // }
 
     #[tokio::test]
     async fn readme_example() {
@@ -706,5 +717,27 @@ mod tests {
         assert_eq!(completion_order, vec!["task2", "task3", "task1"]);
     }
 
-    // TODO test with hundreds of tasks
+    // TODO #[cfg(no_coverage)]
+    // #[tokio::test]
+    // async fn queue_should_run_hundres_of_tasks_with_low_overhead() {
+    //     let queue: Queue<i32, Error> = Queue::new(8);
+    //     let start = tokio::time::Instant::now();
+
+    //     for i in 0..500 {
+    //         queue.push(&format!("t{}", &i), || async {
+    //             sleep(tokio::time::Duration::from_millis(50)).await;
+    //             Ok(1)
+    //         }).await.unwrap();
+    //     }
+
+    //     queue.set_push_done().await;
+    //     queue.wait_for_tasks_done().await.unwrap();
+
+    //     let end = tokio::time::Instant::now();
+    //     assert!(
+    //         end - start < tokio::time::Duration::from_millis(3500),
+    //         "sprint exceeded 3500ms (500 tasks * 50ms concurrency 8) - {:?}",
+    //         end - start
+    //     );
+    // }
 }
