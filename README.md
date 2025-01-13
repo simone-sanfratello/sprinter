@@ -9,6 +9,7 @@ A Rust library for running parallel queued tasks
 
 - 🔄 Queue tasks and run them in parallel according to concurrency limits
 - ⚡ Extremely low execution overhead
+- 🔍 Deduplication of tasks
 
 ## Installation
 
@@ -62,9 +63,9 @@ async fn main() {
     };
 
     // Push tasks to the queue
-    queue.push(&"task1".to_string(), task1).await.unwrap();
-    queue.push(&"task2".to_string(), task2).await.unwrap();
-    queue.push(&"task3".to_string(), task3).await.unwrap();
+    queue.push(&"task1".to_string(), task1, None).await.unwrap();
+    queue.push(&"task2".to_string(), task2, None).await.unwrap();
+    queue.push(&"task3".to_string(), task3, None).await.unwrap();
 
     // Signal that all tasks have been pushed
     queue.set_push_done().await;
@@ -94,6 +95,22 @@ results: {"task1": Ok(Ok(1)), "task2": Ok(Ok(2)), "task3": Ok(Ok(3))}
 
 This will execute tasks in parallel with a maximum concurrency of 2, meaning two tasks can run simultaneously. The output will show tasks running and completing based on their duration and the concurrency limit.
 
+### Deduping Example
+
+Here's an example of using Sprinter to run parallel tasks with deduplication:
+
+```rust
+TODO
+```
+
+It will print:
+
+```
+TODO
+```
+
+This code executes the tasks in parallel; `task1` will be executed only once, while the `on_deduped` function will be called after its resolution.
+
 ## API
 
 ### Creating a Queue
@@ -113,7 +130,7 @@ Parameters:
 
 ### `push`
 ```rust
-async fn push<F, R>(&self, task_id: &String, task: F) -> Result<bool, QueueError>
+async fn push<F, R>(&self, task_id: &String, task: F, task_options: Option<TaskOptions>) -> Result<bool, QueueError>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Future<Output = Result<T, E>> + Send + 'static
@@ -123,6 +140,8 @@ Pushes a new task to the queue. The task will be executed as soon as it is pushe
 Parameters:
 - `task_id`: Unique identifier for the task. Must not be empty.
 - `task`: The task to execute. Must be a future that returns `Result<T, E>`.
+- `task_options`: Optional task options
+    - `on_deduped`: Optional function to be called when the task is deduped
 
 Returns:
 - `Ok(true)` if the task was successfully pushed

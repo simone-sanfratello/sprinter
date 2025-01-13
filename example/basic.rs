@@ -30,9 +30,9 @@ async fn main() {
     };
 
     // Push tasks to the queue
-    queue.push(&"task1".to_string(), task1).await.unwrap();
-    queue.push(&"task2".to_string(), task2).await.unwrap();
-    queue.push(&"task3".to_string(), task3).await.unwrap();
+    queue.push(&"task1".to_string(), task1, None).await.unwrap();
+    queue.push(&"task2".to_string(), task2, None).await.unwrap();
+    queue.push(&"task3".to_string(), task3, None).await.unwrap();
 
     // Signal that all tasks have been pushed
     queue.set_push_done().await;

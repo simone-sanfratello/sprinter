@@ -28,3 +28,6 @@ fix:
 
 example-basic:
     cargo run --example basic
+
+example-deduping:
+    cargo run --example deduping
