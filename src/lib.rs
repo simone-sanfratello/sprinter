@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 
 // TODO generic for TaskId type
 pub type TaskId = String;
@@ -41,24 +41,20 @@ struct CompletionLog {
 
 pub struct Task<GenericTaskResult, GenericTaskResultError> {
     pub id: TaskId,
-    pub task: Arc<
-        Mutex<
-            Pin<Box<dyn Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send>>,
-        >,
-    >, // TODO remove mutex?
+    pub task: Pin<Box<dyn Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + Sync>>,
 }
 
 pub struct TaskInfo<GenericTaskResult, GenericTaskResultError, GenericDedupedResult> {
     pub status: TaskState,
     pub result: Option<Result<GenericTaskResult, GenericTaskResultError>>,
-    pub on_deduped: Option<Vec<Pin<Box<dyn Future<Output = GenericDedupedResult> + Send>>>>,
+    pub on_deduped: Option<Vec<Pin<Box<dyn Future<Output = GenericDedupedResult> + Send + Sync>>>>,
 }
 
 pub struct Queue<GenericTaskResult, GenericTaskResultError, GenericDedupedResult> {
     semaphore: Arc<Semaphore>,
     queue: Arc<Mutex<VecDeque<Task<GenericTaskResult, GenericTaskResultError>>>>,
     index: Arc<
-        Mutex<
+        RwLock<
             HashMap<
                 TaskId,
                 TaskInfo<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>,
@@ -69,17 +65,17 @@ pub struct Queue<GenericTaskResult, GenericTaskResultError, GenericDedupedResult
     queue_state_rx: watch::Receiver<QueueState>,
     tasks_state_tx: watch::Sender<(TaskId, TaskState)>,
     tasks_state_rx: watch::Receiver<(TaskId, TaskState)>,
-    push_done: Arc<Mutex<bool>>,
+    push_done: Arc<RwLock<bool>>,
     #[cfg(test)]
-    completion_log: Arc<Mutex<Vec<CompletionLog>>>,
+    completion_log: Arc<RwLock<Vec<CompletionLog>>>,
 }
 
 impl<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>
     Queue<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>
 where
-    GenericTaskResult: Send + 'static,
-    GenericTaskResultError: Send + 'static,
-    GenericDedupedResult: Send + 'static,
+    GenericTaskResult: Send + Sync + 'static,
+    GenericTaskResultError: Send + Sync + 'static,
+    GenericDedupedResult: Send + Sync + 'static,
 {
     /// Creates a new queue with the given concurrency.
     ///
@@ -103,14 +99,14 @@ where
         Self {
             semaphore: Arc::new(Semaphore::const_new(concurrency)),
             queue: Arc::new(Mutex::new(VecDeque::new())),
-            index: Arc::new(Mutex::new(HashMap::new())),
+            index: Arc::new(RwLock::new(HashMap::new())),
             queue_state_tx,
             queue_state_rx,
             tasks_state_tx,
             tasks_state_rx,
-            push_done: Arc::new(Mutex::new(false)),
+            push_done: Arc::new(RwLock::new(false)),
             #[cfg(test)]
-            completion_log: Arc::new(Mutex::new(Vec::new())),
+            completion_log: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -141,17 +137,23 @@ where
         task: GenericTaskClosure,
     ) -> Result<bool, QueueError>
     where
-        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + Sync + 'static,
         GenericFutureTaskResult:
-            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + Sync + 'static,
     {
         if task_id.is_empty() {
             return Err(QueueError::Other("task_id cannot be empty".to_string()));
         }
 
-        let mut index = self.index.lock().await;
+        // First check with read lock
+        if self.index.read().await.contains_key(task_id) {
+            return Ok(false);
+        }
+
+        // Then acquire write lock for insertion
+        let mut index = self.index.write().await;
+        // Double check in case of race condition
         if index.contains_key(task_id) {
-            drop(index);
             return Ok(false);
         }
 
@@ -183,18 +185,17 @@ where
         on_deduped: GenericDedupedClosure,
     ) -> Result<bool, QueueError>
     where
-        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
-        GenericDedupedClosure: FnOnce() -> GenericFutureDedupedResult + Send + 'static,
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + Sync + 'static,
+        GenericDedupedClosure: FnOnce() -> GenericFutureDedupedResult + Send + Sync + 'static,
         GenericFutureTaskResult:
-            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
-        GenericFutureDedupedResult: Future<Output = GenericDedupedResult> + Send + 'static,
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + Sync + 'static,
+        GenericFutureDedupedResult: Future<Output = GenericDedupedResult> + Send + Sync + 'static,
     {
         if task_id.is_empty() {
             return Err(QueueError::Other("task_id cannot be empty".to_string()));
         }
 
-        let mut index = self.index.lock().await;
-
+        let mut index = self.index.write().await;
         let task_info = index.get_mut(task_id);
         if let Some(t) = task_info {
             if t.status == TaskState::Succeed || t.status == TaskState::Failed {
@@ -229,21 +230,18 @@ where
         task_id: &String,
         task: GenericTaskClosure,
     ) where
-        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + Sync + 'static,
         GenericFutureTaskResult:
-            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + Sync + 'static,
     {
         // wrap the task for future execution
-        let boxed_future: Pin<
-            Box<dyn Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send>,
-        > = Box::pin(task());
-        let future = Arc::new(Mutex::new(boxed_future));
+        let boxed_future = Box::pin(task());
 
         // add task to queue
         let mut queue = self.queue.lock().await;
         queue.push_back(Task {
             id: task_id.clone(),
-            task: future,
+            task: boxed_future,
         });
         drop(queue);
 
@@ -318,7 +316,7 @@ where
                         let _permit = permit;
 
                         {
-                            let mut index = index.lock().await;
+                            let mut index = index.write().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = TaskState::Running;
                                 tasks_state_tx
@@ -328,11 +326,10 @@ where
                         }
 
                         // execute the task
-                        let mut future = task.task.lock().await;
-                        let result = future.as_mut().await;
+                        let result = task.task.await;
 
                         {
-                            let mut index = index.lock().await;
+                            let mut index = index.write().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = if result.is_ok() {
                                     // println!(" >>> Task {} is Succeed", task_id);
@@ -359,7 +356,7 @@ where
                         }
 
                         #[cfg(test)]
-                        completion_log.lock().await.push(CompletionLog {
+                        completion_log.write().await.push(CompletionLog {
                             task_id: task_id.clone(),
                         });
                     });
@@ -369,9 +366,9 @@ where
                     drop(queue_lock);
                 }
 
-                // check if all tasks are done
+                // check if all tasks are done - use read locks for better concurrency
                 let queue_empty = queue.lock().await.is_empty();
-                let tasks_all_pushed = *push_done.lock().await;
+                let tasks_all_pushed = *push_done.read().await;
                 if queue_empty && running_tasks.is_empty() && tasks_all_pushed {
                     queue_state_tx.send(QueueState::Done).unwrap();
                     break;
@@ -389,18 +386,17 @@ where
     /// This is needed since the queue starts processing as soon as the first task is pushed.
     /// Note the queue will not complete until `set_push_done` is called, even if all tasks have been completed.
     pub async fn set_push_done(&self) {
-        let mut push_done = self.push_done.lock().await;
+        let mut push_done = self.push_done.write().await;
         *push_done = true;
-        match self
-            .tasks_state_tx
-            .send((MARKER_TASK_ID_PUSH_DONE.to_string(), TaskState::AllPushed))
-        {
-            Ok(_) => (),
-            Err(_) => {
-                // TODO handle error?
-                // if the channel is closed, we can't send the message
-                // is it possible the channel is closed before setting push_done?
-            }
+        drop(push_done); // Release write lock before sending message
+        
+        // Send message after releasing lock to reduce contention
+        if let Err(_) = self.tasks_state_tx.send((
+            MARKER_TASK_ID_PUSH_DONE.to_string(),
+            TaskState::AllPushed,
+        )) {
+            // Channel closed - queue likely shutting down
+            return;
         }
     }
 
@@ -421,31 +417,31 @@ where
         GenericTaskResult: Clone,
         GenericTaskResultError: Clone,
     {
-        loop {
-            let index = self.index.lock().await;
-
-            match index.get(task_id) {
-                None => {
-                    drop(index);
-                    return Err(QueueError::TaskNotFound(task_id.clone()));
+        // First try with read lock
+        {
+            let index = self.index.read().await;
+            if let Some(info) = index.get(task_id) {
+                if info.status == TaskState::Succeed || info.status == TaskState::Failed {
+                    return Ok(info.result.clone().unwrap());
                 }
-                Some(info) => match info.status {
-                    TaskState::Succeed | TaskState::Failed => {
-                        return Ok(info.result.clone().unwrap());
-                    }
-                    _ => {
-                        drop(index);
-
-                        let mut rx = self.tasks_state_rx.clone();
-                        rx.wait_for(|(id, state)| {
-                            id == task_id
-                                && (*state == TaskState::Succeed || *state == TaskState::Failed)
-                        })
-                        .await
-                        .unwrap();
-                    }
-                },
+            } else {
+                return Err(QueueError::TaskNotFound(task_id.clone()));
             }
+        }
+
+        // If task is not complete, wait for completion
+        let mut rx = self.tasks_state_rx.clone();
+        rx.wait_for(|(id, state)| {
+            id == task_id && (*state == TaskState::Succeed || *state == TaskState::Failed)
+        })
+        .await
+        .unwrap();
+
+        // Get final result
+        let index = self.index.read().await;
+        match index.get(task_id) {
+            Some(info) => Ok(info.result.clone().unwrap()),
+            None => Err(QueueError::TaskNotFound(task_id.clone())),
         }
     }
 
@@ -499,7 +495,7 @@ where
             .await
             .unwrap();
 
-        let index = self.index.lock().await;
+        let index = self.index.read().await;
         let results = index
             .iter()
             .map(|(name, info)| (name.clone(), Ok(info.result.clone().unwrap())))
@@ -516,7 +512,7 @@ where
     #[cfg(test)]
     pub async fn _test_get_completion_order(&self) -> Vec<String> {
         self.completion_log
-            .lock()
+            .read()
             .await
             .iter()
             .map(|log| log.task_id.clone())
@@ -524,18 +520,27 @@ where
     }
 
     pub async fn reset(&self) {
-        let mut index = self.index.lock().await;
-        index.clear();
+        // Acquire all locks in a consistent order to prevent deadlocks
+        let mut index = self.index.write().await;
         let mut queue = self.queue.lock().await;
+        let mut all_tasks_pushed = self.push_done.write().await;
+        
+        // Clear all data structures
+        index.clear();
         queue.clear();
-        let mut all_tasks_pushed = self.push_done.lock().await;
         *all_tasks_pushed = false;
 
         #[cfg(test)]
         {
-            let mut completion_log = self.completion_log.lock().await;
+            let mut completion_log = self.completion_log.write().await;
             completion_log.clear();
         }
+
+        // Release locks before sending message
+        drop(index);
+        drop(queue);
+        drop(all_tasks_pushed);
+
         self.queue_state_tx.send(QueueState::Idle).unwrap();
     }
 }
@@ -681,8 +686,8 @@ mod tests {
         let end = tokio::time::Instant::now();
         // TODO exclude from coverage
         assert!(
-            end - start < tokio::time::Duration::from_millis(1615),
-            "sprint exceeded 1615ms (1500ms longest task + pauses between pushes + 15ms overhead) - {:?}",
+            end - start < tokio::time::Duration::from_millis(1610),
+            "sprint exceeded 1610ms (1500ms longest task + pauses between pushes + 10ms overhead) - {:?}",
             end - start
         );
     }
