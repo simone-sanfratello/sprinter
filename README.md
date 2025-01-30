@@ -28,7 +28,7 @@ sprinter = "0.2.1"
 
 ### Basic Example
 
-Here's a basic example of using Sprinter to run parallel tasks:
+[Here's a basic example](example/basic.rs) of using Sprinter to run parallel tasks:
 
 ```rust
 use sprinter::Queue;
@@ -40,7 +40,7 @@ async fn main() {
     println!("sprint start ...");
     let start = tokio::time::Instant::now();
     // Create a queue with concurrency of 2
-    let queue: Queue<i32, Error> = Queue::new(2);
+    let queue: Queue<i32, Error, ()> = Queue::new(2);
 
     // Define some async tasks
     let task1 = || async {
@@ -63,15 +63,15 @@ async fn main() {
     };
 
     // Push tasks to the queue
-    queue.push(&"task1".to_string(), task1, None).await.unwrap();
-    queue.push(&"task2".to_string(), task2, None).await.unwrap();
-    queue.push(&"task3".to_string(), task3, None).await.unwrap();
+    queue.push(&"task1".to_string(), task1).await.unwrap();
+    queue.push(&"task2".to_string(), task2).await.unwrap();
+    queue.push(&"task3".to_string(), task3).await.unwrap();
 
     // Signal that all tasks have been pushed
     queue.set_push_done().await;
 
     // Wait for all tasks to complete and get results
-    let results = queue.wait_for_results().await;
+    let results = queue.wait_for_tasks_done().await;
 
     let end = tokio::time::Instant::now();
     println!("sprint done in {:?}", end - start);
@@ -97,16 +97,55 @@ This will execute tasks in parallel with a maximum concurrency of 2, meaning two
 
 ### Deduping Example
 
-Here's an example of using Sprinter to run parallel tasks with deduplication:
+[Here's an example](example/deduping.rs) of using Sprinter to run parallel tasks with deduplication:
 
 ```rust
-TODO
+...
+
+for _ in 0..3 {
+    // Push tasks to the queue
+    queue
+        .push_deduping(&"task1".to_string(), task1, || async {
+            println!("task1 deduped!");
+            ()
+        })
+        .await
+        .unwrap();
+    queue
+        .push_deduping(&"task2".to_string(), task2, || async {
+            println!("task2 deduped!");
+            ()
+        })
+        .await
+        .unwrap();
+    queue
+        .push_deduping(&"task3".to_string(), task3, || async {
+            println!("task3 deduped!");
+            ()
+        })
+        .await
+        .unwrap();
+}
+
 ```
 
 It will print:
 
 ```
-TODO
+sprint start ...
+task2 start ...
+task1 start ...
+task2 done!
+task2 deduped!
+task2 deduped!
+task3 start ...
+task3 done!
+task3 deduped!
+task3 deduped!
+task1 done!
+task1 deduped!
+task1 deduped!
+sprint done in 251.677382ms
 ```
 
 This code executes the tasks in parallel; `task1` will be executed only once, while the `on_deduped` function will be called after its resolution.
@@ -116,12 +155,13 @@ This code executes the tasks in parallel; `task1` will be executed only once, wh
 ### Creating a Queue
 
 ```rust
-let queue: Queue<T, E> = Queue::new(concurrency: usize);
+let queue: Queue<T, E, G> = Queue::new(concurrency: usize);
 ```
 
-The Queue type takes two type parameters:
+The Queue type takes three type parameters:
 - `T`: The type of successful task result
 - `E`: The type of error that tasks may return
+- `G`: The type of deduplication callback result
 
 Parameters:
 - `concurrency`: Maximum number of tasks that can run in parallel
@@ -129,8 +169,9 @@ Parameters:
 ### Methods
 
 ### `push`
+
 ```rust
-async fn push<F, R>(&self, task_id: &String, task: F, task_options: Option<TaskOptions>) -> Result<bool, QueueError>
+async fn push<F, R>(&self, task_id: &String, task: F) -> Result<(), QueueError>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Future<Output = Result<T, E>> + Send + 'static
@@ -140,13 +181,27 @@ Pushes a new task to the queue. The task will be executed as soon as it is pushe
 Parameters:
 - `task_id`: Unique identifier for the task. Must not be empty.
 - `task`: The task to execute. Must be a future that returns `Result<T, E>`.
-- `task_options`: Optional task options
-    - `on_deduped`: Optional function to be called when the task is deduped
 
 Returns:
-- `Ok(true)` if the task was successfully pushed
-- `Ok(false)` if a task with the same ID already exists (deduplication)
-- `Err(QueueError)` if the task_id is empty or other errors occur
+- `Ok(())` if the task was successfully pushed
+- `Err(QueueError)` if the task_id is empty or already exists
+
+### `push_deduping`
+
+```rust
+async fn push_deduping<F, R, D, DR>(&self, task_id: &String, task: F, on_deduped: D) -> Result<(), QueueError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    D: FnOnce() -> DR + Send + 'static,
+    R: Future<Output = Result<T, E>> + Send + 'static,
+    DR: Future<Output = G> + Send + 'static
+```
+Pushes a task with deduplication support. If a task with the same ID exists, the `on_deduped` callback will be executed after the original task completes.
+
+Parameters:
+- `task_id`: Unique identifier for the task. Must not be empty.
+- `task`: The task to execute. Must be a future that returns `Result<T, E>`.
+- `on_deduped`: Callback function to execute if the task is deduplicated.
 
 ### `set_push_done`
 ```rust

@@ -29,10 +29,30 @@ async fn main() {
         Ok(3)
     };
 
-    // Push tasks to the queue
-    queue.push(&"task1".to_string(), task1).await.unwrap();
-    queue.push(&"task2".to_string(), task2).await.unwrap();
-    queue.push(&"task3".to_string(), task3).await.unwrap();
+    for _ in 0..3 {
+        // Push tasks to the queue
+        queue
+            .push_deduping(&"task1".to_string(), task1, || async {
+                println!("task1 deduped!");
+                ()
+            })
+            .await
+            .unwrap();
+        queue
+            .push_deduping(&"task2".to_string(), task2, || async {
+                println!("task2 deduped!");
+                ()
+            })
+            .await
+            .unwrap();
+        queue
+            .push_deduping(&"task3".to_string(), task3, || async {
+                println!("task3 deduped!");
+                ()
+            })
+            .await
+            .unwrap();
+    }
 
     // Signal that all tasks have been pushed
     queue.set_push_done().await;

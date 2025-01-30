@@ -16,3 +16,7 @@ tokio-test = "0.4.4"
 [[example]]
 name = "basic"
 path = "example/basic.rs"
+
+[[example]]
+name = "deduping"
+path = "example/deduping.rs"
