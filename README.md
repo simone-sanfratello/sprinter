@@ -21,7 +21,7 @@ Or add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sprinter = "0.2.1"
+sprinter = "0.3.0"
 ```
 
 ## Usage
