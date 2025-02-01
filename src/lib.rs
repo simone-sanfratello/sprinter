@@ -4,24 +4,11 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 
-// TODO
-// - readme for https://docs.rs/sprinter
-// - generic for TaskId type
-
+// TODO generic for TaskId type
 pub type TaskId = String;
 pub const MARKER_TASK_ID_PUSH_DONE: &str = "#";
-
-pub struct Task<T, E> {
-    pub id: TaskId,
-    pub task: Arc<Mutex<Pin<Box<dyn Future<Output = Result<T, E>> + Send>>>>,
-}
-
-pub struct TaskInfo<T, E> {
-    pub status: TaskState,
-    pub result: Option<Result<T, E>>,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskState {
@@ -52,23 +39,47 @@ struct CompletionLog {
     task_id: TaskId,
 }
 
-pub struct Queue<T, E> {
+pub struct Task<GenericTaskResult, GenericTaskResultError> {
+    pub id: TaskId,
+    pub task: Arc<
+        Mutex<
+            Pin<Box<dyn Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send>>,
+        >,
+    >,
+}
+
+pub struct TaskInfo<GenericTaskResult, GenericTaskResultError, GenericDedupedResult> {
+    pub status: TaskState,
+    pub result: Option<Result<GenericTaskResult, GenericTaskResultError>>,
+    pub on_deduped: Option<Vec<Pin<Box<dyn Future<Output = GenericDedupedResult> + Send>>>>,
+}
+
+pub struct Queue<GenericTaskResult, GenericTaskResultError, GenericDedupedResult> {
     semaphore: Arc<Semaphore>,
-    queue: Arc<Mutex<VecDeque<Task<T, E>>>>,
-    index: Arc<Mutex<HashMap<TaskId, TaskInfo<T, E>>>>,
+    queue: Arc<RwLock<VecDeque<Task<GenericTaskResult, GenericTaskResultError>>>>,
+    index: Arc<
+        Mutex<
+            HashMap<
+                TaskId,
+                TaskInfo<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>,
+            >,
+        >,
+    >,
     queue_state_tx: watch::Sender<QueueState>,
     queue_state_rx: watch::Receiver<QueueState>,
     tasks_state_tx: watch::Sender<(TaskId, TaskState)>,
     tasks_state_rx: watch::Receiver<(TaskId, TaskState)>,
-    push_done: Arc<Mutex<bool>>,
+    push_done: Arc<RwLock<bool>>,
     #[cfg(test)]
-    completion_log: Arc<Mutex<Vec<CompletionLog>>>,
+    completion_log: Arc<RwLock<Vec<CompletionLog>>>,
 }
 
-impl<T, E> Queue<T, E>
+impl<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>
+    Queue<GenericTaskResult, GenericTaskResultError, GenericDedupedResult>
 where
-    T: Send + 'static,
-    E: Send + 'static,
+    GenericTaskResult: Send + 'static,
+    GenericTaskResultError: Send + 'static,
+    GenericDedupedResult: Send + 'static,
 {
     /// Creates a new queue with the given concurrency.
     ///
@@ -83,22 +94,23 @@ where
     /// # Examples
     ///
     /// ```rust
-    /// let queue: sprinter::Queue<i32, std::fmt::Error> = sprinter::Queue::new(2);
+    /// let queue: sprinter::Queue<i32, std::fmt::Error, ()> = sprinter::Queue::new(2);
     /// ```
     pub fn new(concurrency: usize) -> Self {
         let (queue_state_tx, queue_state_rx) = watch::channel(QueueState::Idle);
         let (tasks_state_tx, tasks_state_rx) = watch::channel((String::new(), TaskState::Pending));
+
         Self {
             semaphore: Arc::new(Semaphore::const_new(concurrency)),
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(RwLock::new(VecDeque::new())),
             index: Arc::new(Mutex::new(HashMap::new())),
             queue_state_tx,
             queue_state_rx,
             tasks_state_tx,
             tasks_state_rx,
-            push_done: Arc::new(Mutex::new(false)),
+            push_done: Arc::new(RwLock::new(false)),
             #[cfg(test)]
-            completion_log: Arc::new(Mutex::new(Vec::new())),
+            completion_log: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -113,20 +125,25 @@ where
     ///
     /// # Returns
     ///
-    /// True if the task was pushed, false if the task was already in the queue
+    /// Error if the task_id is empty or already exists
     ///
     /// # Examples
     ///
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// let queue: sprinter::Queue<i32, std::fmt::Error> = sprinter::Queue::new(1);
+    /// let queue: sprinter::Queue<i32, std::fmt::Error, ()> = sprinter::Queue::new(1);
     /// queue.push(&"task1".to_string(), || async { Ok(1) }).await.unwrap();
     /// # })
     /// ```
-    pub async fn push<F, R>(&self, task_id: &String, task: F) -> Result<bool, QueueError>
+    pub async fn push<GenericTaskClosure, GenericFutureTaskResult>(
+        &self,
+        task_id: &String,
+        task: GenericTaskClosure,
+    ) -> Result<(), QueueError>
     where
-        F: FnOnce() -> R + Send + 'static,
-        R: Future<Output = Result<T, E>> + Send + 'static,
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
+        GenericFutureTaskResult:
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
     {
         if task_id.is_empty() {
             return Err(QueueError::Other("task_id cannot be empty".to_string()));
@@ -135,23 +152,120 @@ where
         let mut index = self.index.lock().await;
         if index.contains_key(task_id) {
             drop(index);
-            return Ok(false);
+            return Err(QueueError::Other("task_id already exists".to_string()));
         }
+
         index.insert(
             task_id.clone(),
             TaskInfo {
                 status: TaskState::Pending,
                 result: None,
+                on_deduped: None,
             },
         );
         drop(index);
 
+        self._push(task_id, task).await;
+
+        Ok(())
+    }
+
+    /// Pushes a new task to the queue, it will be executed as soon as it is pushed or when the queue is ready.
+    /// Each task must have a unique id, and execution is deduped by `task_id`.
+    /// Note that the queue will not complete until `set_push_done` is called, even if all tasks have been completed.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id`: Unique identifier for the task
+    /// * `task`: Task to be executed
+    /// * `on_deduped`: Callback to be executed if the task is deduplicated
+    ///
+    /// # Returns
+    ///
+    /// Error if the task_id is empty
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// let queue: sprinter::Queue<i32, std::fmt::Error, ()> = sprinter::Queue::new(1);
+    /// queue.push_deduping(&"task1".to_string(), || async { Ok(1) }, || async {
+    ///     println!("task1 deduped!");
+    ///     Ok(())
+    /// }).await.unwrap();
+    /// # })
+    /// ```
+    pub async fn push_deduping<
+        GenericTaskClosure,
+        GenericFutureTaskResult,
+        GenericDedupedClosure,
+        GenericFutureDedupedResult,
+    >(
+        &self,
+        task_id: &String,
+        task: GenericTaskClosure,
+        on_deduped: GenericDedupedClosure,
+    ) -> Result<(), QueueError>
+    where
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
+        GenericDedupedClosure: FnOnce() -> GenericFutureDedupedResult + Send + 'static,
+        GenericFutureTaskResult:
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
+        GenericFutureDedupedResult: Future<Output = GenericDedupedResult> + Send + 'static,
+    {
+        if task_id.is_empty() {
+            return Err(QueueError::Other("task_id cannot be empty".to_string()));
+        }
+
+        let mut index = self.index.lock().await;
+
+        let task_info = index.get_mut(task_id);
+        if let Some(t) = task_info {
+            if t.status == TaskState::Succeed || t.status == TaskState::Failed {
+                let on_deduped = Box::pin(on_deduped());
+                // TODO verbosity println!("SPRINTER: deduped on push {}", task_id);
+                on_deduped.await;
+            } else {
+                let on_deduped = Box::pin(on_deduped());
+                // deduped is always Some here
+                t.on_deduped.as_mut().unwrap().push(on_deduped);
+            }
+            drop(index);
+            return Ok(());
+        }
+
+        index.insert(
+            task_id.clone(),
+            TaskInfo {
+                status: TaskState::Pending,
+                result: None,
+                on_deduped: Some(Vec::new()),
+            },
+        );
+        drop(index);
+
+        self._push(task_id, task).await;
+
+        Ok(())
+    }
+
+    async fn _push<GenericTaskClosure, GenericFutureTaskResult>(
+        &self,
+        task_id: &String,
+        task: GenericTaskClosure,
+    ) where
+        GenericTaskClosure: FnOnce() -> GenericFutureTaskResult + Send + 'static,
+        GenericFutureTaskResult:
+            Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send + 'static,
+    {
         // wrap the task for future execution
-        let boxed_future: Pin<Box<dyn Future<Output = Result<T, E>> + Send>> = Box::pin(task());
+        let boxed_future: Pin<
+            Box<dyn Future<Output = Result<GenericTaskResult, GenericTaskResultError>> + Send>,
+        > = Box::pin(task());
         let future = Arc::new(Mutex::new(boxed_future));
 
         // add task to queue
-        let mut queue = self.queue.lock().await;
+        let mut queue = self.queue.write().await;
         queue.push_back(Task {
             id: task_id.clone(),
             task: future,
@@ -164,15 +278,12 @@ where
 
         // ping the ticker to start processing
         self.tick().await;
-
-        Ok(true)
     }
 
     /// Starts processing tasks in the queue.
     async fn tick(&self) {
         // if already running, do nothing
         if *self.queue_state_rx.borrow() == QueueState::Running {
-            // test: this is covered
             return;
         }
 
@@ -213,7 +324,7 @@ where
                 running_tasks.retain(|handle: &tokio::task::JoinHandle<_>| !handle.is_finished());
 
                 // check if there are any new tasks to process
-                let mut queue_lock = queue.lock().await;
+                let mut queue_lock = queue.write().await;
                 if let Some(task) = queue_lock.pop_front() {
                     drop(queue_lock);
 
@@ -235,7 +346,6 @@ where
                             let mut index = index.lock().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = TaskState::Running;
-                                // TODO handle error, test
                                 tasks_state_tx
                                     .send((task_id.clone(), TaskState::Running))
                                     .unwrap();
@@ -250,24 +360,32 @@ where
                             let mut index = index.lock().await;
                             if let Some(task_info) = index.get_mut(&task_id) {
                                 task_info.status = if result.is_ok() {
-                                    // TODO handle error, test
+                                    // println!(" >>> Task {} is Succeed", task_id);
                                     tasks_state_tx
                                         .send((task_id.clone(), TaskState::Succeed))
                                         .unwrap();
                                     TaskState::Succeed
                                 } else {
-                                    // TODO handle error, test
+                                    // println!(" >>> Task {} is Failed", task_id);
                                     tasks_state_tx
                                         .send((task_id.clone(), TaskState::Failed))
                                         .unwrap();
                                     TaskState::Failed
                                 };
                                 task_info.result = Some(result);
+
+                                // run deduped callbacks
+                                if let Some(on_deduped) = task_info.on_deduped.as_mut() {
+                                    for on_deduped in on_deduped {
+                                        // TODO verbosity println!("SPRINTER: deduped on task complete {}", &task_id);
+                                        on_deduped.await;
+                                    }
+                                }
                             }
                         }
 
                         #[cfg(test)]
-                        completion_log.lock().await.push(CompletionLog {
+                        completion_log.write().await.push(CompletionLog {
                             task_id: task_id.clone(),
                         });
                     });
@@ -278,10 +396,9 @@ where
                 }
 
                 // check if all tasks are done
-                let queue_empty = queue.lock().await.is_empty();
-                let tasks_all_pushed = *push_done.lock().await;
+                let queue_empty = queue.read().await.is_empty();
+                let tasks_all_pushed = *push_done.read().await;
                 if queue_empty && running_tasks.is_empty() && tasks_all_pushed {
-                    // TODO test
                     queue_state_tx.send(QueueState::Done).unwrap();
                     break;
                 }
@@ -298,7 +415,7 @@ where
     /// This is needed since the queue starts processing as soon as the first task is pushed.
     /// Note the queue will not complete until `set_push_done` is called, even if all tasks have been completed.
     pub async fn set_push_done(&self) {
-        let mut push_done = self.push_done.lock().await;
+        let mut push_done = self.push_done.write().await;
         *push_done = true;
         match self
             .tasks_state_tx
@@ -322,10 +439,13 @@ where
     /// # Returns
     ///
     /// The result of the task
-    pub async fn wait_for_task_done(&self, task_id: &String) -> Result<Result<T, E>, QueueError>
+    pub async fn wait_for_task_done(
+        &self,
+        task_id: &String,
+    ) -> Result<Result<GenericTaskResult, GenericTaskResultError>, QueueError>
     where
-        T: Clone,
-        E: Clone,
+        GenericTaskResult: Clone,
+        GenericTaskResultError: Clone,
     {
         loop {
             let index = self.index.lock().await;
@@ -343,7 +463,6 @@ where
                         drop(index);
 
                         let mut rx = self.tasks_state_rx.clone();
-                        // TODO handle error, test
                         rx.wait_for(|(id, state)| {
                             id == task_id
                                 && (*state == TaskState::Succeed || *state == TaskState::Failed)
@@ -363,7 +482,7 @@ where
     ///
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// let queue: sprinter::Queue<i32, std::fmt::Error> = sprinter::Queue::new(2);
+    /// let queue: sprinter::Queue<i32, std::fmt::Error, ()> = sprinter::Queue::new(2);
     /// queue.push(&"task1".to_string(), || async { Ok(1) }).await.unwrap();
     /// queue.push(&"task2".to_string(), || async { Ok(2) }).await.unwrap();
     /// queue.set_push_done().await;
@@ -387,20 +506,21 @@ where
     ///
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// let queue: sprinter::Queue<i32, std::fmt::Error> = sprinter::Queue::new(2);
+    /// let queue: sprinter::Queue<i32, std::fmt::Error, ()> = sprinter::Queue::new(2);
     /// queue.push(&"task1".to_string(), || async { Ok(1) }).await.unwrap();
     /// queue.push(&"task2".to_string(), || async { Ok(2) }).await.unwrap();
     /// queue.set_push_done().await;
     /// queue.wait_for_tasks_done().await.unwrap();
     /// # })
     /// ```
-    pub async fn wait_for_results(&self) -> HashMap<String, Result<Result<T, E>, QueueError>>
+    pub async fn wait_for_results(
+        &self,
+    ) -> HashMap<String, Result<Result<GenericTaskResult, GenericTaskResultError>, QueueError>>
     where
-        T: Clone,
-        E: Clone,
+        GenericTaskResult: Clone,
+        GenericTaskResultError: Clone,
     {
         let mut rx = self.queue_state_rx.clone();
-        // TODO handle error, test
         rx.wait_for(|state| *state == QueueState::Done)
             .await
             .unwrap();
@@ -422,7 +542,7 @@ where
     #[cfg(test)]
     pub async fn _test_get_completion_order(&self) -> Vec<String> {
         self.completion_log
-            .lock()
+            .read()
             .await
             .iter()
             .map(|log| log.task_id.clone())
@@ -432,14 +552,14 @@ where
     pub async fn reset(&self) {
         let mut index = self.index.lock().await;
         index.clear();
-        let mut queue = self.queue.lock().await;
+        let mut queue = self.queue.write().await;
         queue.clear();
-        let mut all_tasks_pushed = self.push_done.lock().await;
+        let mut all_tasks_pushed = self.push_done.write().await;
         *all_tasks_pushed = false;
 
         #[cfg(test)]
         {
-            let mut completion_log = self.completion_log.lock().await;
+            let mut completion_log = self.completion_log.write().await;
             completion_log.clear();
         }
         self.queue_state_tx.send(QueueState::Idle).unwrap();
@@ -449,12 +569,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt::Error;
+    use std::{fmt::Error, sync::atomic::AtomicBool};
     use tokio::time::sleep;
 
     #[tokio::test]
     async fn queue_should_run_tasks_in_parallel() {
-        let queue: Queue<i32, Error> = Queue::new(3);
+        let queue: Queue<i32, Error, ()> = Queue::new(3);
 
         // Create 6 tasks with different durations
         let task1 = || async {
@@ -482,6 +602,7 @@ mod tests {
             Ok(6)
         };
 
+        let start = tokio::time::Instant::now();
         let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
         let _ = queue.push(&"t2".to_string(), task2).await.unwrap();
         let _ = queue.push(&"t3".to_string(), task3).await.unwrap();
@@ -514,11 +635,19 @@ mod tests {
 
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t3", "t2", "t5", "t6", "t4", "t1"]);
+
+        let end = tokio::time::Instant::now();
+        // TODO exclude from coverage
+        assert!(
+            end - start < tokio::time::Duration::from_millis(1503),
+            "sprint exceeded 1503ms (1500ms longest task + 3ms overhead) - {:?}",
+            end - start
+        );
     }
 
     #[tokio::test]
     async fn queue_should_run_tasks_with_delay_between_pushing_tasks() {
-        let queue: Queue<i32, Error> = Queue::new(2);
+        let queue: Queue<i32, Error, ()> = Queue::new(2);
 
         // Create 6 tasks with different durations
         let task1 = || async {
@@ -546,6 +675,7 @@ mod tests {
             Ok(6)
         };
 
+        let start = tokio::time::Instant::now();
         let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
         sleep(tokio::time::Duration::from_millis(100)).await;
         let _ = queue.push(&"t2".to_string(), task2).await.unwrap();
@@ -573,11 +703,19 @@ mod tests {
 
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t1", "t3", "t4", "t5", "t2", "t6"]);
+
+        let end = tokio::time::Instant::now();
+        // TODO exclude from coverage
+        assert!(
+            end - start < tokio::time::Duration::from_millis(1615),
+            "sprint exceeded 1615ms (1500ms longest task + pauses between pushes + 15ms overhead) - {:?}",
+            end - start
+        );
     }
 
     #[tokio::test]
     async fn task_done_should_return_result_when_ready() {
-        let queue: Queue<i32, Error> = Queue::new(2);
+        let queue: Queue<i32, Error, ()> = Queue::new(2);
 
         let task = || async {
             sleep(tokio::time::Duration::from_millis(100)).await;
@@ -594,14 +732,14 @@ mod tests {
 
     #[tokio::test]
     async fn task_done_should_return_error_for_nonexistent_task() {
-        let queue: Queue<i32, Error> = Queue::new(1);
+        let queue: Queue<i32, Error, ()> = Queue::new(1);
         let result = queue.wait_for_task_done(&"nonexistent".to_string()).await;
         assert!(matches!(result, Err(QueueError::TaskNotFound(_))));
     }
 
     #[tokio::test]
     async fn task_push_should_fail_for_empty_task_id() {
-        let queue: Queue<i32, Error> = Queue::new(1);
+        let queue: Queue<i32, Error, ()> = Queue::new(1);
         let result = queue.push(&"".to_string(), || async { Ok(1) }).await;
         assert_eq!(
             result,
@@ -610,72 +748,188 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_run_tasks_deduping() {
-        let queue: Queue<i32, Error> = Queue::new(3);
+    async fn queue_should_run_tasks_deduping() {
+        let queue: Queue<&str, Error, ()> = Queue::new(3);
+        let tasks_counter: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let dedupe_counter: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        let task1 = || async {
-            sleep(tokio::time::Duration::from_millis(50)).await;
-            Ok(1)
-        };
-        let task2 = || async {
-            sleep(tokio::time::Duration::from_millis(50)).await;
-            Ok(2)
-        };
-        let task3 = || async {
-            sleep(tokio::time::Duration::from_millis(50)).await;
-            Ok(3)
-        };
-
-        let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
-        let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
-        let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
-        let _ = queue.push(&"t2".to_string(), task2).await.unwrap();
-        let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
-        let _ = queue.push(&"t3".to_string(), task3).await.unwrap();
-        let _ = queue.push(&"t1".to_string(), task1).await.unwrap();
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        assert_eq!(
+            queue
+                .push_deduping(
+                    &"t1".to_string(),
+                    move || async move {
+                        let mut c = task_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                        sleep(tokio::time::Duration::from_millis(50)).await;
+                        Ok::<&str, Error>("result1")
+                    },
+                    move || async move {
+                        let mut c = dedupe_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                    }
+                )
+                .await,
+            Ok(())
+        );
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        assert_eq!(
+            queue
+                .push_deduping(
+                    &"t1".to_string(),
+                    move || async move {
+                        let mut c = task_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                        sleep(tokio::time::Duration::from_millis(50)).await;
+                        Ok::<&str, Error>("result1")
+                    },
+                    move || async move {
+                        let mut c = dedupe_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                    }
+                )
+                .await,
+            Ok(())
+        );
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        assert_eq!(
+            queue
+                .push_deduping(
+                    &"t2".to_string(),
+                    move || async move {
+                        let mut c = task_counter_ref.lock().await;
+                        let count = c.entry("t2".to_string()).or_insert(0);
+                        *count += 1;
+                        sleep(tokio::time::Duration::from_millis(50)).await;
+                        Ok::<&str, Error>("result2")
+                    },
+                    move || async move {
+                        let mut c = dedupe_counter_ref.lock().await;
+                        let count = c.entry("t2".to_string()).or_insert(0);
+                        *count += 1;
+                    }
+                )
+                .await,
+            Ok(())
+        );
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        assert_eq!(
+            queue
+                .push_deduping(
+                    &"t3".to_string(),
+                    move || async move {
+                        let mut c = task_counter_ref.lock().await;
+                        let count = c.entry("t3".to_string()).or_insert(0);
+                        *count += 1;
+                        sleep(tokio::time::Duration::from_millis(50)).await;
+                        Ok::<&str, Error>("result3")
+                    },
+                    move || async move {
+                        let mut c = dedupe_counter_ref.lock().await;
+                        let count = c.entry("t3".to_string()).or_insert(0);
+                        *count += 1;
+                    }
+                )
+                .await,
+            Ok(())
+        );
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        assert_eq!(
+            queue
+                .push_deduping(
+                    &"t1".to_string(),
+                    move || async move {
+                        let mut c = task_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                        sleep(tokio::time::Duration::from_millis(50)).await;
+                        Ok::<&str, Error>("result1")
+                    },
+                    move || async move {
+                        let mut c = dedupe_counter_ref.lock().await;
+                        let count = c.entry("t1".to_string()).or_insert(0);
+                        *count += 1;
+                    }
+                )
+                .await,
+            Ok(())
+        );
         queue.set_push_done().await;
 
         let results = queue.wait_for_results().await;
 
         let expected_results = HashMap::from([
-            ("t1".to_string(), Ok(Ok(1))),
-            ("t2".to_string(), Ok(Ok(2))),
-            ("t3".to_string(), Ok(Ok(3))),
+            ("t1".to_string(), Ok(Ok("result1"))),
+            ("t2".to_string(), Ok(Ok("result2"))),
+            ("t3".to_string(), Ok(Ok("result3"))),
         ]);
         assert_eq!(results, expected_results);
 
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["t1", "t2", "t3"]);
+
+        let task_counter_ref = Arc::clone(&tasks_counter);
+        let counter = task_counter_ref.lock().await;
+        assert_eq!(counter.get("t1").unwrap(), &1);
+        assert_eq!(counter.get("t2").unwrap(), &1);
+        assert_eq!(counter.get("t3").unwrap(), &1);
+
+        let dedupe_counter_ref = Arc::clone(&dedupe_counter);
+        let counter = dedupe_counter_ref.lock().await;
+        assert_eq!(counter.get("t1").unwrap(), &2);
+        assert!(counter.get("t2").is_none());
+        assert!(counter.get("t3").is_none());
     }
 
     #[tokio::test]
-    async fn should_wait_for_single_task_completion() {
-        let queue: Queue<i32, Error> = Queue::new(99);
+    async fn on_deduped_should_be_called() {
+        let queue: Queue<i32, Error, ()> = Queue::new(2);
+        let task = || async { Ok(1) };
+        let deduped = Arc::new(AtomicBool::new(false));
 
-        let task_id = "test_task_done".to_string();
-        queue.push(&task_id, || async { Ok(99) }).await.unwrap();
-
-        let result = queue.wait_for_task_done(&task_id).await.unwrap();
-        assert_eq!(result, Ok(99));
+        let _ = queue
+            .push_deduping(&"task1".to_string(), task, || async {
+                assert!(false, "on_deduped on first task should not be called");
+            })
+            .await
+            .unwrap();
+        let d = Arc::clone(&deduped);
+        let _ = queue
+            .push_deduping(&"task1".to_string(), task, move || async move {
+                // println!("on_deduped on second task");
+                d.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .await
+            .unwrap();
 
         queue.set_push_done().await;
-        assert_eq!(queue.wait_for_tasks_done().await, Ok(()));
+        queue.wait_for_tasks_done().await.unwrap();
+
+        let d = Arc::try_unwrap(deduped).unwrap();
+        assert!(d.into_inner(), "on_deduped on second task should be called");
     }
 
-    // #[tokio::test]
-    // async fn queue_task_done_should_handle_nonexistent_task() {
-    //     let queue: Queue<i32, Error> = Queue::new(&"test_task_done_nonexistent".to_string(), &1);
-    //     let result = queue.task_done(&"nonexistent".to_string()).await;
-    //     assert!(result.is_err());
-    //     assert!(matches!(result.unwrap_err(), QueueError::TaskNotFound(_)));
-    // }
+    // TODO mix push and push_deduping
+
+    // TODO test with hundreds of tasks
 
     #[tokio::test]
-    async fn readme_example() {
+    async fn readme_basic_example() {
         println!("sprint start ...");
         let start = tokio::time::Instant::now();
-        let queue: Queue<i32, Error> = Queue::new(2);
+        // Create a queue with concurrency of 2
+        let queue: Queue<i32, Error, ()> = Queue::new(2);
 
+        // Define some async tasks
         let task1 = || async {
             println!("task1 start ...");
             sleep(tokio::time::Duration::from_millis(250)).await;
@@ -695,15 +949,20 @@ mod tests {
             Ok(3)
         };
 
+        // Push tasks to the queue
         queue.push(&"task1".to_string(), task1).await.unwrap();
         queue.push(&"task2".to_string(), task2).await.unwrap();
         queue.push(&"task3".to_string(), task3).await.unwrap();
+
+        // Signal that all tasks have been pushed
         queue.set_push_done().await;
 
+        // Wait for all tasks to complete and get results
         let results = queue.wait_for_results().await;
 
         let end = tokio::time::Instant::now();
         println!("sprint done in {:?}", end - start);
+        println!("results: {:?}", results);
 
         assert_eq!(
             results,
@@ -716,28 +975,4 @@ mod tests {
         let completion_order = queue._test_get_completion_order().await;
         assert_eq!(completion_order, vec!["task2", "task3", "task1"]);
     }
-
-    // TODO #[cfg(no_coverage)]
-    // #[tokio::test]
-    // async fn queue_should_run_hundres_of_tasks_with_low_overhead() {
-    //     let queue: Queue<i32, Error> = Queue::new(8);
-    //     let start = tokio::time::Instant::now();
-
-    //     for i in 0..500 {
-    //         queue.push(&format!("t{}", &i), || async {
-    //             sleep(tokio::time::Duration::from_millis(50)).await;
-    //             Ok(1)
-    //         }).await.unwrap();
-    //     }
-
-    //     queue.set_push_done().await;
-    //     queue.wait_for_tasks_done().await.unwrap();
-
-    //     let end = tokio::time::Instant::now();
-    //     assert!(
-    //         end - start < tokio::time::Duration::from_millis(3500),
-    //         "sprint exceeded 3500ms (500 tasks * 50ms concurrency 8) - {:?}",
-    //         end - start
-    //     );
-    // }
 }
