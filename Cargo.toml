@@ -5,6 +5,7 @@ version = "0.3.0"
 edition = "2021"
 authors = ["Simone Sanfratello <simone.sanfra@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/simone-sanfratello/sprinter"
 
 [dependencies]
 tokio = { version = "1.51.0", features = ["full"] }

@@ -21,4 +21,9 @@ Tokio async task queue with bounded concurrency, deduping (`push_deduping`), and
 ## Docs and semver
 
 - `set_push_done`, `reset`, and `wait_for_results` return `Result` (breaking changes vs 0.3). Update `README.md` and examples when those APIs change.
-- Prefer **not** creating or expanding markdown files unless the user asked.
+- Prefer **not** creating or expanding markdown files unless the user asked. **`CHANGELOG.md` is generated only by GitHub Actions** (`release-prepare`); do not add or edit it in the repo for normal work.
+
+## Releases
+
+- **Conventional commits** drive semver suggestions via git-cliff (`cliff.toml`). Flow: run **Release (prepare branch)** → merge `release/v*` PR → **Release (finalize)** creates tag + GitHub Release → run **Deploy (crates.io)** with `CARGO_REGISTRY_TOKEN` when publishing.
+- A **baseline `v*` tag** must exist on the repo matching the last released `Cargo.toml` version before `release-prepare` can propose the next one.

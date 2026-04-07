@@ -1,0 +1,108 @@
+# Opens release/v* from main: bumps version (conventional commits or explicit bump), regenerates CHANGELOG, opens PR.
+name: Release (prepare branch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (auto uses conventional commits since the latest v* tag)"
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+        default: auto
+
+concurrency:
+  group: release-prepare
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Baseline v* tag required
+        run: |
+          set -euo pipefail
+          if ! git describe --tags --abbrev=0 --match 'v*' >/dev/null 2>&1; then
+            echo "::error::No v* tag found. Create one matching the released line in Cargo.toml (for example: git tag v0.3.0 <commit> && git push origin v0.3.0)."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Compute next version and change log
+        id: rel
+        run: |
+          set -euo pipefail
+          BUMP="${{ inputs.bump }}"
+          LAST_TAG="$(git describe --tags --abbrev=0 --match 'v*')"
+
+          if [ "$BUMP" = "auto" ]; then
+            NEXT_TAG="$(git cliff --bumped-version)"
+            if [ "$NEXT_TAG" = "$LAST_TAG" ]; then
+              echo "::error::No semantic version change from conventional commits since ${LAST_TAG}. Add feat/fix/breaking commits or run again with patch/minor/major."
+              exit 1
+            fi
+            git cliff -o CHANGELOG.md --bump
+          else
+            NEXT_TAG="$(git cliff --bumped-version --bump "$BUMP")"
+            git cliff -o CHANGELOG.md --bump "$BUMP"
+          fi
+
+          VERSION_NUM="${NEXT_TAG#v}"
+          echo "version_tag=${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version_num=${VERSION_NUM}" >> "$GITHUB_OUTPUT"
+          echo "branch=release/${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Cargo.toml version
+        run: cargo set-version "${{ steps.rel.outputs.version_num }}"
+
+      - name: Refresh Cargo.lock
+        run: cargo check -p sprinter
+
+      - name: Configure git and push branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${{ steps.rel.outputs.branch }}"
+          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+            echo "::error::Branch $BRANCH already exists on origin; delete or merge it first."
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH"
+          git add CHANGELOG.md Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${{ steps.rel.outputs.version_tag }}"
+          git push origin "$BRANCH"
+
+          OPEN="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq 'length')"
+          if [ "$OPEN" != "0" ]; then
+            echo "Open PR already exists for $BRANCH"
+            exit 0
+          fi
+
+          gh pr create --base main --head "$BRANCH" \
+            --title "release: ${{ steps.rel.outputs.version_tag }}" \
+            --body "Automated release branch. **Merge this PR to main** to create GitHub tag + GitHub Release (workflow \`release-finalize.yml\`). Then run **Deploy (crates.io)** to publish if needed."
