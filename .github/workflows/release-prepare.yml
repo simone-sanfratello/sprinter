@@ -110,20 +110,23 @@ jobs:
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           BRANCH="${{ steps.rel.outputs.branch }}"
-          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
-            echo "::error::Branch $BRANCH already exists on origin; delete or merge it first."
-            exit 1
-          fi
-
           git status --short
-          git checkout -b "$BRANCH"
+          # -B: create or reset the branch at current HEAD but keep the working tree (release files from prior steps).
+          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+            echo "::notice::Remote $BRANCH already exists; updating it from the regenerated release commit (re-run safe)."
+          fi
+          git checkout -B "$BRANCH"
           git add CHANGELOG.md Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
             echo "::error::Nothing to commit (CHANGELOG / Cargo.toml / Cargo.lock unchanged). Check git-cliff and cargo set-version steps."
             exit 1
           fi
           git commit -m "chore(release): ${{ steps.rel.outputs.version_tag }}"
-          git push origin "$BRANCH"
+          if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
+            git push --force-with-lease origin "$BRANCH"
+          else
+            git push origin "$BRANCH"
+          fi
 
       - name: Open pull request
         env:
