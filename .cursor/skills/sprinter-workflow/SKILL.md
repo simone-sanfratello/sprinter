@@ -36,13 +36,23 @@ description: Maintains the sprinter Tokio task-queue crate—coordinator invaria
 
 ## Releases and crates.io (GitHub Actions)
 
+### GitHub repository settings (required for *Release Prepare*)
+
+If **Release Prepare** fails on **Commit and push release branch** or **Open pull request**, check:
+
+1. **Settings → Actions → General → Workflow permissions** — set **Read and write permissions** (not “Read repository contents and packages”). Read-only defaults break `git push` for `release/v*` branches and `git push` for baseline tags.
+2. On the same page, enable **Allow GitHub Actions to create and approve pull requests**. Without this, `gh pr create` often returns `Resource not accessible by integration`.
+3. **Rulesets / branch protection** — ensure pushes from **GitHub Actions** (or the default `GITHUB_TOKEN`) are not blocked for the actions that need to push branches and tags. If your org forbids it, use a **fine-grained or classic PAT** with `contents: write` and `pull-requests: write`, stored as a repository secret (e.g. `RELEASE_AUTOMATION_TOKEN`), and pass it to `actions/checkout` (`token: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}`) and set `GH_TOKEN` / `GITHUB_TOKEN` in the push/PR steps to that secret.
+
+### Workflows
+
 Three workflows in `.github/workflows/`:
 
-1. **`release-prepare.yml`** — *Release (prepare branch)* — `workflow_dispatch` with bump `auto|patch|minor|major`. Requires at least one **`v*`** git tag on `main` that matches the line already shipped (same version as `Cargo.toml` for that release). **Writes `CHANGELOG.md` via git-cliff** (do not keep a hand-authored copy on `main`), bumps `Cargo.toml` with `cargo set-version`, pushes `release/vX.Y.Z` and opens a PR to `main`.
-2. **`release-finalize.yml`** — *Release (tag + GitHub Release)* — runs when a PR **from** `release/v*` **into** `main` is **merged** (same-repo only). Creates the `vX.Y.Z` tag on the merge commit and a GitHub Release with notes sliced from the `CHANGELOG.md` introduced by that merge.
+1. **`release-prepare.yml`** — *Release (prepare branch)* — `workflow_dispatch` with bump `auto|patch|minor|major`. If no `v*` tag exists, the workflow creates and pushes **`v<Cargo.toml version>`** at the commit that introduced that `version = "…"` line (`git log -S`). **Writes `CHANGELOG.md` via git-cliff** (do not keep a hand-authored copy on `main`), bumps `Cargo.toml` with `cargo set-version`, pushes `release/vX.Y.Z` and opens a PR to `main`. If that release branch **already exists** (e.g. a previous run pushed it but failed later), the workflow **resets** it from the current default branch and **`git push --force-with-lease`** so you can re-run without deleting the branch manually.
+2. **`release-finalize.yml`** — *Release (tag + GitHub Release)* — runs when a PR **from** `release/v*` **into the default branch** is **merged** (same-repo only). Creates the `vX.Y.Z` tag on the merge commit and a GitHub Release with notes sliced from the `CHANGELOG.md` introduced by that merge.
 3. **`deploy-crates.yml`** — *Deploy (crates.io)* — `workflow_dispatch`; optional `tag` input (default: latest `v*` by sort). Runs `cargo publish --locked`. Needs repo secret **`CARGO_REGISTRY_TOKEN`** ([crates.io token](https://crates.io/settings/tokens)).
 
-**One-time setup:** If there is no `v*` tag yet, create one at the commit that matches the current `Cargo.toml` version (e.g. `git tag v0.3.0 <commit> && git push origin v0.3.0`) so `release-prepare` can compute the next version.
+**Baseline tag:** If that automatic `-S` lookup fails (no such commit), create `v<Cargo.toml version>` on the correct commit manually and push it before running *Release Prepare* again.
 
 ## References
 
