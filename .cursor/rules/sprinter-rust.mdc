@@ -1,0 +1,23 @@
+---
+description: Rust implementation patterns for sprinter queue and coordinator
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Sprinter Rust conventions
+
+## Architecture (do not regress)
+
+- **Single coordinator**: `coordinator_active` CAS so concurrent `tick()` does not spawn duplicate loops.
+- **Do not hold `index` mutex across** `await` of dedupe callbacks or other open-ended futures; `take()` callbacks, drop lock, then await.
+- **Wake coordinator** when a worker finishes (including post-status dedupe work)—`Notify` + `select!` with `tasks_state` watch, not watch alone.
+- **`wait_for_task_done`**: clone a watch receiver and loop `changed()`; handle terminal state without requiring a stored result if logic guarantees it (else `QueueError::Other`).
+
+## Types / style
+
+- Respect existing aliases (`BoxedTaskFuture`, `DedupeFuture`, `TaskIndex`) and `#[rustfmt::skip]` on `push` / `push_deduping` / `tick` / `wait_for_task_done` where single-line literals matter for LLVM/tarpaulin line attribution.
+- `rustfmt.toml` uses `max_width = 200` in this repo.
+
+## Examples
+
+- Examples may `unwrap()` on the happy path; the **library** should not.

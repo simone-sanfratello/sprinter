@@ -35,7 +35,7 @@ async fn main() {
     queue.push(&"task3".to_string(), task3).await.unwrap();
 
     // Signal that all tasks have been pushed
-    queue.set_push_done().await;
+    queue.set_push_done().await.unwrap();
 
     // Wait for all tasks to complete and get results
     queue.wait_for_tasks_done().await.unwrap();

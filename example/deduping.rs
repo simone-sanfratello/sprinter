@@ -34,28 +34,25 @@ async fn main() {
         queue
             .push_deduping(&"task1".to_string(), task1, || async {
                 println!("task1 deduped!");
-                ()
             })
             .await
             .unwrap();
         queue
             .push_deduping(&"task2".to_string(), task2, || async {
                 println!("task2 deduped!");
-                ()
             })
             .await
             .unwrap();
         queue
             .push_deduping(&"task3".to_string(), task3, || async {
                 println!("task3 deduped!");
-                ()
             })
             .await
             .unwrap();
     }
 
     // Signal that all tasks have been pushed
-    queue.set_push_done().await;
+    queue.set_push_done().await.unwrap();
 
     // Wait for all tasks to complete and get results
     queue.wait_for_tasks_done().await.unwrap();

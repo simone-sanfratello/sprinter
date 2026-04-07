@@ -68,10 +68,10 @@ async fn main() {
     queue.push(&"task3".to_string(), task3).await.unwrap();
 
     // Signal that all tasks have been pushed
-    queue.set_push_done().await;
+    queue.set_push_done().await.unwrap();
 
-    // Wait for all tasks to complete and get results
-    let results = queue.wait_for_tasks_done().await;
+    // Wait for all tasks to complete and collect results
+    let results = queue.wait_for_results().await.unwrap();
 
     let end = tokio::time::Instant::now();
     println!("sprint done in {:?}", end - start);
@@ -205,7 +205,7 @@ Parameters:
 
 ### `set_push_done`
 ```rust
-async fn set_push_done(&self)
+async fn set_push_done(&self) -> Result<(), QueueError>
 ```
 Signals that all tasks have been pushed to the queue. This must be called even if all tasks have completed, as the queue will not finish processing until this is called.
 
@@ -233,9 +233,9 @@ Note: `set_push_done()` must be called before this method.
 
 ### `wait_for_results`
 ```rust
-async fn wait_for_results(&self) -> HashMap<String, Result<Result<T, E>, QueueError>>
+async fn wait_for_results(&self) -> Result<HashMap<String, Result<Result<T, E>, QueueError>>, QueueError>
 ```
-Waits for all tasks to complete and returns a map of task IDs to their results.
+Waits for all tasks to complete and returns a map of task IDs to their results (or an error if the queue state channel closed).
 
 Note: `set_push_done()` must be called before this method.
 
@@ -255,7 +255,7 @@ Returns the current state of the queue. Possible states are:
 
 ### `reset`
 ```rust
-async fn reset(&self)
+async fn reset(&self) -> Result<(), QueueError>
 ```
 Resets the queue to its initial state
 

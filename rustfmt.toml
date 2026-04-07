@@ -1,0 +1,2 @@
+# Wider lines reduce spurious "uncovered" regions in LLVM/tarpaulin line coverage.
+max_width = 200
