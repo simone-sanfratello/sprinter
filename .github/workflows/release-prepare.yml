@@ -24,6 +24,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,13 +98,16 @@ jobs:
       - name: Refresh Cargo.lock
         run: cargo check -p sprinter
 
-      - name: Configure git and push branch
+      - name: Commit and push release branch
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "1+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Explicit HTTPS auth (more reliable than persisted credentials for some org defaults).
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           BRANCH="${{ steps.rel.outputs.branch }}"
           if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
@@ -110,17 +115,34 @@ jobs:
             exit 1
           fi
 
+          git status --short
           git checkout -b "$BRANCH"
           git add CHANGELOG.md Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "::error::Nothing to commit (CHANGELOG / Cargo.toml / Cargo.lock unchanged). Check git-cliff and cargo set-version steps."
+            exit 1
+          fi
           git commit -m "chore(release): ${{ steps.rel.outputs.version_tag }}"
           git push origin "$BRANCH"
 
-          OPEN="$(gh pr list --head "$BRANCH" --base main --state open --json number --jq 'length')"
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.rel.outputs.branch }}"
+          OPEN="$(gh pr list --head "$BRANCH" --base "${DEFAULT_BRANCH}" --state open --json number --jq 'length')"
           if [ "$OPEN" != "0" ]; then
-            echo "Open PR already exists for $BRANCH"
+            echo "Open PR already exists for $BRANCH → ${DEFAULT_BRANCH}"
             exit 0
           fi
-
-          gh pr create --base main --head "$BRANCH" \
+          gh pr create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${DEFAULT_BRANCH}" \
+            --head "$BRANCH" \
             --title "release: ${{ steps.rel.outputs.version_tag }}" \
-            --body "Automated release branch. **Merge this PR to main** to create GitHub tag + GitHub Release (workflow \`release-finalize.yml\`). Then run **Deploy (crates.io)** to publish if needed."
+            --body "Automated release branch. **Merge this PR to ${DEFAULT_BRANCH}** to create GitHub tag + GitHub Release (\`release-finalize.yml\`). Then run **Deploy (crates.io)** to publish if needed." \
+            || {
+              echo "::error::gh pr create failed. Enable **Workflow permissions → Read and write** and **Allow GitHub Actions to create and approve pull requests** (repo Settings → Actions → General). See sprinter-workflow skill."
+              exit 1
+            }

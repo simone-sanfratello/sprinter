@@ -27,3 +27,4 @@ Tokio async task queue with bounded concurrency, deduping (`push_deduping`), and
 
 - **Conventional commits** drive semver suggestions via git-cliff (`cliff.toml`). Flow: run **Release (prepare branch)** → merge `release/v*` PR → **Release (finalize)** creates tag + GitHub Release → run **Deploy (crates.io)** with `CARGO_REGISTRY_TOKEN` when publishing.
 - **`release-prepare`** needs a **baseline `v*`** for git-cliff; if none exists, the workflow pushes **`v<Cargo.toml version>`** at the commit found with `git log -S` on `Cargo.toml`, or fails with instructions to tag manually.
+- **GitHub:** For Actions to push branches/tags and open PRs, the repo needs **Workflow permissions → Read and write** and **Allow GitHub Actions to create and approve pull requests** (details in `sprinter-workflow` skill).
