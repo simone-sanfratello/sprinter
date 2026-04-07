@@ -38,11 +38,11 @@ description: Maintains the sprinter Tokio task-queue crate—coordinator invaria
 
 Three workflows in `.github/workflows/`:
 
-1. **`release-prepare.yml`** — *Release (prepare branch)* — `workflow_dispatch` with bump `auto|patch|minor|major`. Requires at least one **`v*`** git tag on `main` that matches the line already shipped (same version as `Cargo.toml` for that release). **Writes `CHANGELOG.md` via git-cliff** (do not keep a hand-authored copy on `main`), bumps `Cargo.toml` with `cargo set-version`, pushes `release/vX.Y.Z` and opens a PR to `main`.
+1. **`release-prepare.yml`** — *Release (prepare branch)* — `workflow_dispatch` with bump `auto|patch|minor|major`. If no `v*` tag exists, the workflow creates and pushes **`v<Cargo.toml version>`** at the commit that introduced that `version = "…"` line (`git log -S`). **Writes `CHANGELOG.md` via git-cliff** (do not keep a hand-authored copy on `main`), bumps `Cargo.toml` with `cargo set-version`, pushes `release/vX.Y.Z` and opens a PR to `main`.
 2. **`release-finalize.yml`** — *Release (tag + GitHub Release)* — runs when a PR **from** `release/v*` **into** `main` is **merged** (same-repo only). Creates the `vX.Y.Z` tag on the merge commit and a GitHub Release with notes sliced from the `CHANGELOG.md` introduced by that merge.
 3. **`deploy-crates.yml`** — *Deploy (crates.io)* — `workflow_dispatch`; optional `tag` input (default: latest `v*` by sort). Runs `cargo publish --locked`. Needs repo secret **`CARGO_REGISTRY_TOKEN`** ([crates.io token](https://crates.io/settings/tokens)).
 
-**One-time setup:** If there is no `v*` tag yet, create one at the commit that matches the current `Cargo.toml` version (e.g. `git tag v0.3.0 <commit> && git push origin v0.3.0`) so `release-prepare` can compute the next version.
+**Baseline tag:** If that automatic `-S` lookup fails (no such commit), create `v<Cargo.toml version>` on the correct commit manually and push it before running *Release Prepare* again.
 
 ## References
 

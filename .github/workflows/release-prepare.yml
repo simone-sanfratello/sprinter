@@ -1,11 +1,11 @@
 # Opens release/v* from main: bumps version (conventional commits or explicit bump), regenerates CHANGELOG, opens PR.
-name: Release (prepare branch)
+name: Release Prepare
 
 on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump (auto uses conventional commits since the latest v* tag)"
+        description: "Version bump"
         type: choice
         options:
           - auto
@@ -28,15 +28,33 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Baseline v* tag required
+      - name: Ensure baseline v* tag for git-cliff
         run: |
           set -euo pipefail
-          if ! git describe --tags --abbrev=0 --match 'v*' >/dev/null 2>&1; then
-            echo "::error::No v* tag found. Create one matching the released line in Cargo.toml (for example: git tag v0.3.0 <commit> && git push origin v0.3.0)."
+          if git describe --tags --abbrev=0 --match 'v*' >/dev/null 2>&1; then
+            echo "Using existing tag: $(git describe --tags --abbrev=0 --match 'v*')"
+            exit 0
+          fi
+
+          VER="$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)"
+          BASE="$(git log -1 --format=%H -S "version = \"${VER}\"" -- Cargo.toml || true)"
+          if [ -z "$BASE" ]; then
+            echo "::error::No v* tags and no commit introducing version=${VER} in Cargo.toml (git log -S). Add a baseline tag, e.g. git tag v${VER} <commit> && git push origin v${VER}"
             exit 1
           fi
+
+          TAG="v${VER}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists at $(git rev-parse "$TAG")"
+          else
+            git tag "$TAG" "$BASE"
+            echo "::notice::Created baseline tag ${TAG} at ${BASE} (introduces version ${VER} in Cargo.toml)."
+          fi
+
+          git push origin "refs/tags/${TAG}"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -84,7 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "1+github-actions[bot]@users.noreply.github.com"
 
           BRANCH="${{ steps.rel.outputs.branch }}"
           if git ls-remote --heads origin "refs/heads/${BRANCH}" | grep -q .; then
