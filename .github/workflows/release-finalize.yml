@@ -1,0 +1,67 @@
+# When a release/* PR is merged to main: create annotated tag + GitHub Release using CHANGELOG section.
+name: Release (tag + GitHub Release)
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: release-finalize-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: meta
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.pull_request.head.ref }}"
+          VER="${REF#release/v}"
+          TAG="v${VER}"
+          CARGO_VER="$(awk -F '\"' '/^version = / {print $2; exit}' Cargo.toml)"
+          if [ "$VER" != "$CARGO_VER" ]; then
+            echo "::error::Branch ${REF} implies version ${VER} but Cargo.toml has ${CARGO_VER}"
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          VER="${{ steps.meta.outputs.version }}"
+          awk -v v="$VER" '
+            $0 ~ "^## \\[" v "\\]" {p=1; print; next}
+            p && $0 ~ "^## \\[" && $0 !~ "^## \\[" v "\\]" {exit}
+            p {print}
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "::error::No section ## [${VER}] in CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Create GitHub Release (and tag on merge commit)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body_path: release_notes.md
+          target_commitish: ${{ github.event.pull_request.merge_commit_sha }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

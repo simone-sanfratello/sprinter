@@ -1,0 +1,59 @@
+# Publishes an existing git tag to crates.io (default: latest v* tag by version sort).
+name: Deploy (crates.io)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to publish (e.g. v0.3.1). Leave empty to use the latest v* tag.'
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require crates.io token
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "::error::Repository secret CARGO_REGISTRY_TOKEN is not set. Create an API token at https://crates.io/settings/tokens and add it under Settings → Secrets."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Select tag
+        id: pick
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="$(git tag -l 'v*' --sort=-v:refname | head -n1 || true)"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag selected and no v* tags found."
+            exit 1
+          fi
+          if ! git rev-parse "$TAG^{commit}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} does not exist in this repo."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tag
+        run: git checkout "${{ steps.pick.outputs.tag }}"
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

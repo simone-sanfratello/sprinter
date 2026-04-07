@@ -32,6 +32,17 @@ description: Maintains the sprinter Tokio task-queue crate—coordinator invaria
 ## Versioning
 
 - Breaking public API → bump semver in `Cargo.toml` and sync `README.md` signatures.
+- **Commit style:** Prefer [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, breaking footers / `!`) so release automation can pick the next semver via [git-cliff](https://git-cliff.org/) (`cliff.toml`).
+
+## Releases and crates.io (GitHub Actions)
+
+Three workflows in `.github/workflows/`:
+
+1. **`release-prepare.yml`** — *Release (prepare branch)* — `workflow_dispatch` with bump `auto|patch|minor|major`. Requires at least one **`v*`** git tag on `main` that matches the line already shipped (same version as `Cargo.toml` for that release). **Writes `CHANGELOG.md` via git-cliff** (do not keep a hand-authored copy on `main`), bumps `Cargo.toml` with `cargo set-version`, pushes `release/vX.Y.Z` and opens a PR to `main`.
+2. **`release-finalize.yml`** — *Release (tag + GitHub Release)* — runs when a PR **from** `release/v*` **into** `main` is **merged** (same-repo only). Creates the `vX.Y.Z` tag on the merge commit and a GitHub Release with notes sliced from the `CHANGELOG.md` introduced by that merge.
+3. **`deploy-crates.yml`** — *Deploy (crates.io)* — `workflow_dispatch`; optional `tag` input (default: latest `v*` by sort). Runs `cargo publish --locked`. Needs repo secret **`CARGO_REGISTRY_TOKEN`** ([crates.io token](https://crates.io/settings/tokens)).
+
+**One-time setup:** If there is no `v*` tag yet, create one at the commit that matches the current `Cargo.toml` version (e.g. `git tag v0.3.0 <commit> && git push origin v0.3.0`) so `release-prepare` can compute the next version.
 
 ## References
 
