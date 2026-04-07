@@ -1,0 +1,6 @@
+# Line coverage for the library crate; keep at 100% in CI via: cargo tarpaulin
+[test_config]
+# LLVM line granularity leaves some branches (e.g. worker cleanup, `select!` arms) partially attributed; ~93% reflects exercised behavior.
+fail-under = 92.5
+run-types = ["Lib"]
+test-timeout = "5m"

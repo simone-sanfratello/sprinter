@@ -1,0 +1,24 @@
+---
+description: Unit tests, failure injection, and coverage for sprinter
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Sprinter testing
+
+## Serialization
+
+- **Every** `#[tokio::test]` in `src/lib.rs` must start with `let _s = crate::test_serial();` **or** use `HookTestSession::new()` first (which acquires the same mutex). Otherwise global `FAIL_*` atomics leak across parallel `cargo test`.
+
+## Failure injection
+
+- Use `HookTestSession` when toggling `failure_injection::FAIL_*`; it resets flags on drop.
+- Hook tests document defensive paths (channel closed, worker send abort, coordinator break, etc.). Non-hook tests must not rely on leftover hook state.
+
+## Commands
+
+- `cargo test`, `cargo clippy --all-targets`, `cargo tarpaulin --config tarpaulin.toml` (see `tarpaulin.toml`: `fail-under`, `run-types = ["Lib"]`, `test-timeout`).
+
+## Coverage vs behavior
+
+- Treat tarpaulin percentages as **approximate** (LLVM line granularity). Prefer **behavioral** tests for lifecycle edge cases (`set_push_done` without `push`, missing `set_push_done`, `new(0)`, duplicate IDs after completion, marker key absent from `wait_for_results`, etc.).

@@ -1,0 +1,24 @@
+---
+description: Sprinter crate identity, API contracts, and non-negotiables for agents
+alwaysApply: true
+---
+
+# Sprinter (`sprinter`)
+
+Tokio async task queue with bounded concurrency, deduping (`push_deduping`), and coordinator-driven lifecycle.
+
+## Session / lifecycle
+
+- Work is **not** “session complete” until `set_push_done()` is called, even if every task future has returned.
+- `wait_for_tasks_done` / `wait_for_results` wait on **queue** `Done`, not merely on idle workers. If **nothing** was ever `push`ed, the coordinator may never start—`set_push_done` alone can leave waiters stuck (by design today).
+- `new(0)` accepts `push` but **no** permits run tasks; `wait_for_tasks_done` can stall. Treat as a sharp edge or guard at API boundary if exposing publicly.
+
+## Panics and errors
+
+- **Library code must not** `unwrap`, `expect`, or `panic!` on user-reachable paths. Prefer `Result<_, QueueError>` and graceful coordinator exit on channel/semaphore failures.
+- `failure_injection` (atomics + `hook | res.is_err()`) is used so tests hit the same branches as production sends and receives.
+
+## Docs and semver
+
+- `set_push_done`, `reset`, and `wait_for_results` return `Result` (breaking changes vs 0.3). Update `README.md` and examples when those APIs change.
+- Prefer **not** creating or expanding markdown files unless the user asked.
